@@ -730,6 +730,12 @@ function(InfoManager, BubbleManager, Renderer, Map, Animation, Sprite, AnimatedT
             }
             //>>includeEnd("prodHost");
             
+            // Server-message consumers. Each handler below subscribes to one event
+            // emitted by GameClient (see the Events catalogue in gameclient.js). The
+            // events are grouped there by layer - conn:* (connection lifecycle),
+            // player:* (the local player's state), entity:* (world entities) and
+            // ui:* (HUD, chat, notifications) - and the handlers here are the code
+            // that consumes each one.
             this.client.onDispatched(function(host, port) {
                 log.debug("Dispatched to game server "+host+ ":"+port);
                 
@@ -1066,6 +1072,9 @@ function(InfoManager, BubbleManager, Renderer, Map, Animation, Sprite, AnimatedT
                     self.player.switchArmor(self.sprites["firefox"]);
                 });
             
+                // Remaining server-message consumers (entity:*, player:* and ui:*
+                // events from GameClient) are registered here, once the local player
+                // exists and they have something to act on.
                 self.client.onSpawnItem(function(item, x, y) {
                     log.info("Spawned " + Types.getKindAsString(item.kind) + " (" + item.id + ") at "+x+", "+y);
                     self.addItem(item, x, y);
