@@ -40,7 +40,7 @@ function main(config) {
         var world, // the one in which the player will be spawned
             connect = function() {
                 if(world) {
-                    world.connect_callback(new Player(connection, world));
+                    world.connectPlayer(connection);
                 }
             };
         
