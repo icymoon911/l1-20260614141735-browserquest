@@ -1,15 +1,31 @@
 
 define(['infomanager', 'bubble', 'renderer', 'map', 'animation', 'sprite', 'tile',
         'warrior', 'gameclient', 'audio', 'updater', 'transition', 'pathfinder',
-        'item', 'mob', 'npc', 'player', 'character', 'chest', 'mobs', 'exceptions', 'config', '../../shared/js/gametypes'],
+        'item', 'mob', 'npc', 'player', 'character', 'chest', 'mobs', 'exceptions',
+        'achievements', 'config', '../../shared/js/gametypes'],
 function(InfoManager, BubbleManager, Renderer, Map, Animation, Sprite, AnimatedTile,
          Warrior, GameClient, AudioManager, Updater, Transition, Pathfinder,
-         Item, Mob, Npc, Player, Character, Chest, Mobs, Exceptions, config) {
-    
+         Item, Mob, Npc, Player, Character, Chest, Mobs, Exceptions, Achievements, config) {
+
+    /**
+     * Game — the engine and the running world.
+     *
+     * Responsibility boundary:
+     *   - Game      → entities, map, pathing, combat, rendering, networking and
+     *                 the render/update tick. Owns the runtime flags
+     *                 game.ready (assets loaded) and game.started (connected).
+     *   - App       → page / UI lifecycle (intro, death, error) and startup flow.
+     *   - UIManager → in-game HUD and panels.
+     *
+     * Game never touches the DOM directly. It reports lifecycle and gameplay
+     * events through onXxx() callbacks; main.js (wireGameToApp) routes those to
+     * App's state helpers and to UIManager. Server config is owned here and read
+     * by App via game.config.
+     */
     var Game = Class.extend({
         init: function(app) {
             this.app = app;
-            this.app.config = config;
+            this.config = config;
             this.ready = false;
             this.started = false;
             this.hasNeverStarted = true;
