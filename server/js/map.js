@@ -9,18 +9,18 @@ var cls = require('./lib/class')
 module.exports = Map = cls.Class.extend({    
     init: function(filepath) {
     	var self = this;
-    
+
     	this.isLoaded = false;
-    
-    	path.exists(filepath, function(exists) {
+
+    	fs.exists(filepath, function(exists) {
             if(!exists) {
                 log.error(filepath + " doesn't exist.");
                 return;
             }
-        
+
             fs.readFile(filepath, function(err, file) {
                 var json = JSON.parse(file.toString());
-            
+
                 self.initMap(json);
             });
         });
