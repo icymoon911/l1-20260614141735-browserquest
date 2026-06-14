@@ -1,232 +1,440 @@
 
-define(['player', 'entityfactory', 'lib/bison'], function(Player, EntityFactory, BISON) {
+/**
+ * GameClient — Network facade for the game.
+ *
+ * This is the SINGLE entry point for all client ↔ server communication.
+ *
+ * Architecture (top = wire, bottom = game logic):
+ *
+ *   WebSocket raw bytes
+ *        │
+ *        ▼
+ *   Connection            (connection.js)
+ *     │  Transport lifecycle, "go"/"timeout" protocol, send guard
+ *     │
+ *     ▼ raw data string
+ *   MessageHandler        (messagehandler.js)
+ *     │  Decode (JSON/BISON), validate, route by message type
+ *     │
+ *     ▼ decoded array → registered handler function
+ *   GameClient            (this file)
+ *     │  Parse array → named fields → fire semantic callback
+ *     │
+ *     ▼ semantic callback(name, args...)
+ *   Game                  (game.js)
+ *        Game logic: entities, combat, UI, achievements
+ *
+ * Handler categories (see MessageHandler.Category):
+ *
+ *   CONNECTION — WELCOME, LIST
+ *   ENTITY     — SPAWN, DESPAWN, DESTROY, MOVE, LOOTMOVE, TELEPORT,
+ *                BLINK, DROP, EQUIP
+ *   COMBAT     — ATTACK, DAMAGE
+ *   PLAYER     — HEALTH, HP, KILL
+ *   UI         — CHAT, POPULATION
+ *
+ * Wire protocol: UNCHANGED.  All Types.Messages.* type IDs and array
+ * field layouts are identical to the original implementation.
+ */
+define(['player', 'entityfactory', 'lib/bison', 'connection', 'messagehandler'],
+function(Player, EntityFactory, BISON, Connection, MessageHandler) {
+
+    var Category = MessageHandler.Category;
 
     var GameClient = Class.extend({
         init: function(host, port) {
-            this.connection = null;
             this.host = host;
             this.port = port;
-    
-            this.connected_callback = null;
-            this.spawn_callback = null;
-            this.movement_callback = null;
-        
-            this.handlers = [];
-            this.handlers[Types.Messages.WELCOME] = this.receiveWelcome;
-            this.handlers[Types.Messages.MOVE] = this.receiveMove;
-            this.handlers[Types.Messages.LOOTMOVE] = this.receiveLootMove;
-            this.handlers[Types.Messages.ATTACK] = this.receiveAttack;
-            this.handlers[Types.Messages.SPAWN] = this.receiveSpawn;
-            this.handlers[Types.Messages.DESPAWN] = this.receiveDespawn;
-            this.handlers[Types.Messages.SPAWN_BATCH] = this.receiveSpawnBatch;
-            this.handlers[Types.Messages.HEALTH] = this.receiveHealth;
-            this.handlers[Types.Messages.CHAT] = this.receiveChat;
-            this.handlers[Types.Messages.EQUIP] = this.receiveEquipItem;
-            this.handlers[Types.Messages.DROP] = this.receiveDrop;
-            this.handlers[Types.Messages.TELEPORT] = this.receiveTeleport;
-            this.handlers[Types.Messages.DAMAGE] = this.receiveDamage;
-            this.handlers[Types.Messages.POPULATION] = this.receivePopulation;
-            this.handlers[Types.Messages.LIST] = this.receiveList;
-            this.handlers[Types.Messages.DESTROY] = this.receiveDestroy;
-            this.handlers[Types.Messages.KILL] = this.receiveKill;
-            this.handlers[Types.Messages.HP] = this.receiveHitPoints;
-            this.handlers[Types.Messages.BLINK] = this.receiveBlink;
-        
-            this.useBison = false;
-            this.enable();
+
+            // --- Layer 1: Transport ---
+            this.connection = new Connection();
+
+            // --- Layer 2: Message dispatch ---
+            this.messageHandler = new MessageHandler();
+
+            // --- Semantic callbacks (set by Game via on* methods) ---
+            this._callbacks = {};
+
+            // Wire: Connection → MessageHandler
+            this.connection.onMessage(
+                this.messageHandler.handleMessage.bind(this.messageHandler)
+            );
+
+            // Register all inbound message handlers
+            this._registerHandlers();
         },
-    
+
+        // ===================================================================
+        // Listener enable / disable  (delegates to MessageHandler)
+        // ===================================================================
+
         enable: function() {
-            this.isListening = true;
+            this.messageHandler.enable();
         },
-    
+
         disable: function() {
-            this.isListening = false;
+            this.messageHandler.disable();
         },
-        
+
+        // ===================================================================
+        // Connection lifecycle
+        // ===================================================================
+
+        /**
+         * Connect to the server.
+         *
+         * @param {Boolean} [dispatcherMode]  If true, use the dispatcher
+         *        protocol (front-end load-balancer proxy).
+         */
         connect: function(dispatcherMode) {
-            var url = "ws://"+ this.host +":"+ this.port +"/",
-                self = this;
-            
-            log.info("Trying to connect to server : "+url);
+            var self = this;
 
-            if(window.MozWebSocket) {
-                this.connection = new MozWebSocket(url);
-            } else {
-                this.connection = new WebSocket(url);
-            }
-            
-            if(dispatcherMode) {
-                this.connection.onmessage = function(e) {
-                    var reply = JSON.parse(e.data);
+            // Make host/port available to Connection for log messages
+            this.connection.host = this.host;
+            this.connection.port = this.port;
 
-                    if(reply.status === 'OK') {
-                        self.dispatched_callback(reply.host, reply.port);
-                    } else if(reply.status === 'FULL') {
-                        alert("BrowserQuest is currently at maximum player population. Please retry later.");
-                    } else {
-                        alert("Unknown error while connecting to BrowserQuest.");
-                    }
-                };
-            } else {
-                this.connection.onopen = function(e) {
-                    log.info("Connected to server "+self.host+":"+self.port);
-                };
+            // Forward transport-level events to semantic callbacks
+            this.connection.onReady(function() {
+                self._fire('connected');
+            });
 
-                this.connection.onmessage = function(e) {
-                    if(e.data === "go") {
-                        if(self.connected_callback) {
-                            self.connected_callback();
-                        }
-                        return;
-                    }
-                    if(e.data === 'timeout') {
-                        self.isTimeout = true;
-                        return;
-                    }
-                    
-                    self.receiveMessage(e.data);
-                };
+            this.connection.onClose(function(message) {
+                self._fire('disconnected', message);
+            });
 
-                this.connection.onerror = function(e) {
-                    log.error(e, true);
-                };
+            this.connection.onDispatched(function(host, port) {
+                self._fire('dispatched', host, port);
+            });
 
-                this.connection.onclose = function() {
-                    log.debug("Connection closed");
-                    $('#container').addClass('error');
-                    
-                    if(self.disconnected_callback) {
-                        if(self.isTimeout) {
-                            self.disconnected_callback("You have been disconnected for being inactive for too long");
-                        } else {
-                            self.disconnected_callback("The connection to BrowserQuest has been lost");
-                        }
-                    }
-                };
-            }
+            this.connection.connect(this.host, this.port, dispatcherMode);
         },
+
+        // ===================================================================
+        // Outbound messages  (send*)
+        // ===================================================================
 
         sendMessage: function(json) {
             var data;
-            if(this.connection.readyState === 1) {
-                if(this.useBison) {
-                    data = BISON.encode(json);
-                } else {
-                    data = JSON.stringify(json);
-                }
-                this.connection.send(data);
+            if(this.messageHandler.useBison) {
+                data = BISON.encode(json);
+            } else {
+                data = JSON.stringify(json);
             }
+            this.connection.send(data);
         },
 
-        receiveMessage: function(message) {
-            var data, action;
-        
-            if(this.isListening) {
-                if(this.useBison) {
-                    data = BISON.decode(message);
-                } else {
-                    data = JSON.parse(message);
-                }
-
-                log.debug("data: " + message);
-
-                if(data instanceof Array) {
-                    if(data[0] instanceof Array) {
-                        // Multiple actions received
-                        this.receiveActionBatch(data);
-                    } else {
-                        // Only one action received
-                        this.receiveAction(data);
-                    }
-                }
-            }
+        sendHello: function(player) {
+            this.sendMessage([Types.Messages.HELLO,
+                              player.name,
+                              Types.getKindFromString(player.getSpriteName()),
+                              Types.getKindFromString(player.getWeaponName())]);
         },
-    
-        receiveAction: function(data) {
-            var action = data[0];
-            if(this.handlers[action] && _.isFunction(this.handlers[action])) {
-                this.handlers[action].call(this, data);
-            }
-            else {
-                log.error("Unknown action : " + action);
-            }
+
+        sendMove: function(x, y) {
+            this.sendMessage([Types.Messages.MOVE, x, y]);
         },
-    
-        receiveActionBatch: function(actions) {
+
+        sendLootMove: function(item, x, y) {
+            this.sendMessage([Types.Messages.LOOTMOVE, x, y, item.id]);
+        },
+
+        sendAggro: function(mob) {
+            this.sendMessage([Types.Messages.AGGRO, mob.id]);
+        },
+
+        sendAttack: function(mob) {
+            this.sendMessage([Types.Messages.ATTACK, mob.id]);
+        },
+
+        sendHit: function(mob) {
+            this.sendMessage([Types.Messages.HIT, mob.id]);
+        },
+
+        sendHurt: function(mob) {
+            this.sendMessage([Types.Messages.HURT, mob.id]);
+        },
+
+        sendChat: function(text) {
+            this.sendMessage([Types.Messages.CHAT, text]);
+        },
+
+        sendLoot: function(item) {
+            this.sendMessage([Types.Messages.LOOT, item.id]);
+        },
+
+        sendTeleport: function(x, y) {
+            this.sendMessage([Types.Messages.TELEPORT, x, y]);
+        },
+
+        sendWho: function(ids) {
+            ids.unshift(Types.Messages.WHO);
+            this.sendMessage(ids);
+        },
+
+        sendZone: function() {
+            this.sendMessage([Types.Messages.ZONE]);
+        },
+
+        sendOpen: function(chest) {
+            this.sendMessage([Types.Messages.OPEN, chest.id]);
+        },
+
+        sendCheck: function(id) {
+            this.sendMessage([Types.Messages.CHECK, id]);
+        },
+
+        // ===================================================================
+        // Inbound handler registration
+        // ===================================================================
+
+        /**
+         * Register all inbound message handlers on the MessageHandler.
+         *
+         * Each handler:  raw array → extract fields → fire semantic callback.
+         * Grouped by category for readability.
+         *
+         * NOTE: SPAWN_BATCH is intentionally NOT registered — the original
+         * code referenced Types.Messages.SPAWN_BATCH which does not exist
+         * in the protocol.  Batch messages are handled transparently by
+         * MessageHandler._dispatchBatch via nested array detection.
+         */
+        _registerHandlers: function() {
             var self = this;
 
-            _.each(actions, function(action) {
-                self.receiveAction(action);
-            });
+            // ---------------------------------------------------------------
+            // CONNECTION — Handshake, session lifecycle
+            // ---------------------------------------------------------------
+
+            this.messageHandler.register(
+                Types.Messages.WELCOME,
+                function(data) {
+                    var id   = data[1],
+                        name = data[2],
+                        x    = data[3],
+                        y    = data[4],
+                        hp   = data[5];
+                    self._fire('welcome', id, name, x, y, hp);
+                },
+                Category.CONNECTION
+            );
+
+            this.messageHandler.register(
+                Types.Messages.LIST,
+                function(data) {
+                    // data[0] = LIST type; rest = entity id list
+                    var list = data.slice(1);
+                    self._fire('list', list);
+                },
+                Category.CONNECTION
+            );
+
+            // ---------------------------------------------------------------
+            // ENTITY — Spawn / despawn / destroy
+            // ---------------------------------------------------------------
+
+            this.messageHandler.register(
+                Types.Messages.SPAWN,
+                function(data) { self._handleSpawn(data); },
+                Category.ENTITY
+            );
+
+            this.messageHandler.register(
+                Types.Messages.DESPAWN,
+                function(data) {
+                    self._fire('despawnEntity', data[1]);
+                },
+                Category.ENTITY
+            );
+
+            this.messageHandler.register(
+                Types.Messages.DESTROY,
+                function(data) {
+                    self._fire('entityDestroy', data[1]);
+                },
+                Category.ENTITY
+            );
+
+            // ---------------------------------------------------------------
+            // ENTITY — Movement
+            // ---------------------------------------------------------------
+
+            this.messageHandler.register(
+                Types.Messages.MOVE,
+                function(data) {
+                    var id = data[1], x = data[2], y = data[3];
+                    self._fire('entityMove', id, x, y);
+                },
+                Category.ENTITY
+            );
+
+            this.messageHandler.register(
+                Types.Messages.LOOTMOVE,
+                function(data) {
+                    var id = data[1], item = data[2];
+                    self._fire('playerMoveToItem', id, item);
+                },
+                Category.ENTITY
+            );
+
+            this.messageHandler.register(
+                Types.Messages.TELEPORT,
+                function(data) {
+                    var id = data[1], x = data[2], y = data[3];
+                    self._fire('playerTeleport', id, x, y);
+                },
+                Category.ENTITY
+            );
+
+            this.messageHandler.register(
+                Types.Messages.BLINK,
+                function(data) {
+                    self._fire('itemBlink', data[1]);
+                },
+                Category.ENTITY
+            );
+
+            // ---------------------------------------------------------------
+            // ENTITY — State changes (drop, equip)
+            // ---------------------------------------------------------------
+
+            this.messageHandler.register(
+                Types.Messages.DROP,
+                function(data) {
+                    var mobId  = data[1],
+                        id     = data[2],
+                        kind   = data[3],
+                        item   = EntityFactory.createEntity(kind, id);
+
+                    item.wasDropped = true;
+                    item.playersInvolved = data[4];
+
+                    self._fire('dropItem', item, mobId);
+                },
+                Category.ENTITY
+            );
+
+            this.messageHandler.register(
+                Types.Messages.EQUIP,
+                function(data) {
+                    var id       = data[1],
+                        itemKind = data[2];
+                    self._fire('playerEquipItem', id, itemKind);
+                },
+                Category.ENTITY
+            );
+
+            // ---------------------------------------------------------------
+            // COMBAT — Attack, damage
+            // ---------------------------------------------------------------
+
+            this.messageHandler.register(
+                Types.Messages.ATTACK,
+                function(data) {
+                    var attacker = data[1],
+                        target   = data[2];
+                    self._fire('entityAttack', attacker, target);
+                },
+                Category.COMBAT
+            );
+
+            this.messageHandler.register(
+                Types.Messages.DAMAGE,
+                function(data) {
+                    var id  = data[1],
+                        dmg = data[2];
+                    self._fire('playerDamageMob', id, dmg);
+                },
+                Category.COMBAT
+            );
+
+            // ---------------------------------------------------------------
+            // PLAYER — Health, hit points, kill
+            // ---------------------------------------------------------------
+
+            this.messageHandler.register(
+                Types.Messages.HEALTH,
+                function(data) {
+                    var points  = data[1],
+                        isRegen = data[2] ? true : false;
+                    self._fire('playerChangeHealth', points, isRegen);
+                },
+                Category.PLAYER
+            );
+
+            this.messageHandler.register(
+                Types.Messages.HP,
+                function(data) {
+                    var maxHp = data[1];
+                    self._fire('playerChangeMaxHitPoints', maxHp);
+                },
+                Category.PLAYER
+            );
+
+            this.messageHandler.register(
+                Types.Messages.KILL,
+                function(data) {
+                    var mobKind = data[1];
+                    self._fire('playerKillMob', mobKind);
+                },
+                Category.PLAYER
+            );
+
+            // ---------------------------------------------------------------
+            // UI — Chat, population
+            // ---------------------------------------------------------------
+
+            this.messageHandler.register(
+                Types.Messages.CHAT,
+                function(data) {
+                    var id   = data[1],
+                        text = data[2];
+                    self._fire('chatMessage', id, text);
+                },
+                Category.UI
+            );
+
+            this.messageHandler.register(
+                Types.Messages.POPULATION,
+                function(data) {
+                    var worldPlayers = data[1],
+                        totalPlayers = data[2];
+                    self._fire('populationChange', worldPlayers, totalPlayers);
+                },
+                Category.UI
+            );
         },
-    
-        receiveWelcome: function(data) {
-            var id = data[1],
-                name = data[2],
-                x = data[3],
-                y = data[4],
-                hp = data[5];
-        
-            if(this.welcome_callback) {
-                this.welcome_callback(id, name, x, y, hp);
-            }
-        },
-    
-        receiveMove: function(data) {
-            var id = data[1],
-                x = data[2],
-                y = data[3];
-        
-            if(this.move_callback) {
-                this.move_callback(id, x, y);
-            }
-        },
-    
-        receiveLootMove: function(data) {
-            var id = data[1], 
-                item = data[2];
-        
-            if(this.lootmove_callback) {
-                this.lootmove_callback(id, item);
-            }
-        },
-    
-        receiveAttack: function(data) {
-            var attacker = data[1], 
-                target = data[2];
-        
-            if(this.attack_callback) {
-                this.attack_callback(attacker, target);
-            }
-        },
-    
-        receiveSpawn: function(data) {
-            var id = data[1],
+
+        // ===================================================================
+        // SPAWN handler (complex — routes by entity kind)
+        // ===================================================================
+
+        /**
+         * Handle SPAWN messages.
+         * Creates the entity via EntityFactory and fires the appropriate
+         * typed callback: spawnItem, spawnChest, or spawnCharacter.
+         */
+        _handleSpawn: function(data) {
+            var id   = data[1],
                 kind = data[2],
-                x = data[3],
-                y = data[4];
-        
+                x    = data[3],
+                y    = data[4];
+
             if(Types.isItem(kind)) {
                 var item = EntityFactory.createEntity(kind, id);
-            
-                if(this.spawn_item_callback) {
-                    this.spawn_item_callback(item, x, y);
-                }
-            } else if(Types.isChest(kind)) {
-                var item = EntityFactory.createEntity(kind, id);
-            
-                if(this.spawn_chest_callback) {
-                    this.spawn_chest_callback(item, x, y);
-                }
-            } else {
+                this._fire('spawnItem', item, x, y);
+            }
+            else if(Types.isChest(kind)) {
+                var chest = EntityFactory.createEntity(kind, id);
+                this._fire('spawnChest', chest, x, y);
+            }
+            else {
                 var name, orientation, target, weapon, armor;
-            
+
                 if(Types.isPlayer(kind)) {
-                    name = data[5];
+                    name        = data[5];
                     orientation = data[6];
-                    armor = data[7];
-                    weapon = data[8];
+                    armor       = data[7];
+                    weapon      = data[8];
                     if(data.length > 9) {
                         target = data[9];
                     }
@@ -239,306 +447,76 @@ define(['player', 'entityfactory', 'lib/bison'], function(Player, EntityFactory,
                 }
 
                 var character = EntityFactory.createEntity(kind, id, name);
-            
+
                 if(character instanceof Player) {
                     character.weaponName = Types.getKindAsString(weapon);
                     character.spriteName = Types.getKindAsString(armor);
                 }
-            
-                if(this.spawn_character_callback) {
-                    this.spawn_character_callback(character, x, y, orientation, target);
-                }
+
+                this._fire('spawnCharacter', character, x, y, orientation, target);
             }
-        },
-    
-        receiveDespawn: function(data) {
-            var id = data[1];
-        
-            if(this.despawn_callback) {
-                this.despawn_callback(id);
-            }
-        },
-    
-        receiveHealth: function(data) {
-            var points = data[1],
-                isRegen = false;
-        
-            if(data[2]) {
-                isRegen = true;
-            }
-        
-            if(this.health_callback) {
-                this.health_callback(points, isRegen);
-            }
-        },
-    
-        receiveChat: function(data) {
-            var id = data[1],
-                text = data[2];
-        
-            if(this.chat_callback) {
-                this.chat_callback(id, text);
-            }
-        },
-    
-        receiveEquipItem: function(data) {
-            var id = data[1],
-                itemKind = data[2];
-        
-            if(this.equip_callback) {
-                this.equip_callback(id, itemKind);
-            }
-        },
-    
-        receiveDrop: function(data) {
-            var mobId = data[1],
-                id = data[2],
-                kind = data[3];
-        
-            var item = EntityFactory.createEntity(kind, id);
-            item.wasDropped = true;
-            item.playersInvolved = data[4];
-        
-            if(this.drop_callback) {
-                this.drop_callback(item, mobId);
-            }
-        },
-    
-        receiveTeleport: function(data) {
-            var id = data[1],
-                x = data[2],
-                y = data[3];
-        
-            if(this.teleport_callback) {
-                this.teleport_callback(id, x, y);
-            }
-        },
-    
-        receiveDamage: function(data) {
-            var id = data[1],
-                dmg = data[2];
-        
-            if(this.dmg_callback) {
-                this.dmg_callback(id, dmg);
-            }
-        },
-    
-        receivePopulation: function(data) {
-            var worldPlayers = data[1],
-                totalPlayers = data[2];
-        
-            if(this.population_callback) {
-                this.population_callback(worldPlayers, totalPlayers);
-            }
-        },
-    
-        receiveKill: function(data) {
-            var mobKind = data[1];
-        
-            if(this.kill_callback) {
-                this.kill_callback(mobKind);
-            }
-        },
-    
-        receiveList: function(data) {
-            data.shift();
-        
-            if(this.list_callback) {
-                this.list_callback(data);
-            }
-        },
-    
-        receiveDestroy: function(data) {
-            var id = data[1];
-        
-            if(this.destroy_callback) {
-                this.destroy_callback(id);
-            }
-        },
-    
-        receiveHitPoints: function(data) {
-            var maxHp = data[1];
-        
-            if(this.hp_callback) {
-                this.hp_callback(maxHp);
-            }
-        },
-    
-        receiveBlink: function(data) {
-            var id = data[1];
-        
-            if(this.blink_callback) {
-                this.blink_callback(id);
-            }
-        },
-        
-        onDispatched: function(callback) {
-            this.dispatched_callback = callback;
         },
 
-        onConnected: function(callback) {
-            this.connected_callback = callback;
-        },
-        
-        onDisconnected: function(callback) {
-            this.disconnected_callback = callback;
+        // ===================================================================
+        // Callback infrastructure
+        // ===================================================================
+
+        /**
+         * Store a semantic callback.
+         */
+        _setCallback: function(name, fn) {
+            this._callbacks[name] = fn;
         },
 
-        onWelcome: function(callback) {
-            this.welcome_callback = callback;
+        /**
+         * Fire a semantic callback by name with the given arguments.
+         */
+        _fire: function(name) {
+            var fn = this._callbacks[name];
+            if(fn) {
+                fn.apply(null, Array.prototype.slice.call(arguments, 1));
+            }
         },
 
-        onSpawnCharacter: function(callback) {
-            this.spawn_character_callback = callback;
-        },
-    
-        onSpawnItem: function(callback) {
-            this.spawn_item_callback = callback;
-        },
-    
-        onSpawnChest: function(callback) {
-            this.spawn_chest_callback = callback;
-        },
+        // ===================================================================
+        // Semantic callback registration  (called by Game)
+        // ===================================================================
 
-        onDespawnEntity: function(callback) {
-            this.despawn_callback = callback;
-        },
+        // --- Connection lifecycle ---
+        onDispatched:    function(cb) { this._setCallback('dispatched', cb); },
+        onConnected:     function(cb) { this._setCallback('connected', cb); },
+        onDisconnected:  function(cb) { this._setCallback('disconnected', cb); },
 
-        onEntityMove: function(callback) {
-            this.move_callback = callback;
-        },
+        // --- CONNECTION category ---
+        onWelcome:       function(cb) { this._setCallback('welcome', cb); },
+        onEntityList:    function(cb) { this._setCallback('list', cb); },
 
-        onEntityAttack: function(callback) {
-            this.attack_callback = callback;
-        },
-    
-        onPlayerChangeHealth: function(callback) {
-            this.health_callback = callback;
-        },
-    
-        onPlayerEquipItem: function(callback) {
-            this.equip_callback = callback;
-        },
-    
-        onPlayerMoveToItem: function(callback) {
-            this.lootmove_callback = callback;
-        },
-    
-        onPlayerTeleport: function(callback) {
-            this.teleport_callback = callback;
-        },
-    
-        onChatMessage: function(callback) {
-            this.chat_callback = callback;
-        },
-    
-        onDropItem: function(callback) {
-            this.drop_callback = callback;
-        },
-    
-        onPlayerDamageMob: function(callback) {
-            this.dmg_callback = callback;
-        },
-    
-        onPlayerKillMob: function(callback) {
-            this.kill_callback = callback;
-        },
-    
-        onPopulationChange: function(callback) {
-            this.population_callback = callback;
-        },
-    
-        onEntityList: function(callback) {
-            this.list_callback = callback;
-        },
-    
-        onEntityDestroy: function(callback) {
-            this.destroy_callback = callback;
-        },
-    
-        onPlayerChangeMaxHitPoints: function(callback) {
-            this.hp_callback = callback;
-        },
-    
-        onItemBlink: function(callback) {
-            this.blink_callback = callback;
-        },
+        // --- ENTITY category ---
+        onSpawnCharacter:   function(cb) { this._setCallback('spawnCharacter', cb); },
+        onSpawnItem:        function(cb) { this._setCallback('spawnItem', cb); },
+        onSpawnChest:       function(cb) { this._setCallback('spawnChest', cb); },
+        onDespawnEntity:    function(cb) { this._setCallback('despawnEntity', cb); },
+        onEntityDestroy:    function(cb) { this._setCallback('entityDestroy', cb); },
+        onEntityMove:       function(cb) { this._setCallback('entityMove', cb); },
+        onPlayerMoveToItem: function(cb) { this._setCallback('playerMoveToItem', cb); },
+        onPlayerTeleport:   function(cb) { this._setCallback('playerTeleport', cb); },
+        onItemBlink:        function(cb) { this._setCallback('itemBlink', cb); },
+        onDropItem:         function(cb) { this._setCallback('dropItem', cb); },
+        onPlayerEquipItem:  function(cb) { this._setCallback('playerEquipItem', cb); },
 
-        sendHello: function(player) {
-            this.sendMessage([Types.Messages.HELLO,
-                              player.name,
-                              Types.getKindFromString(player.getSpriteName()),
-                              Types.getKindFromString(player.getWeaponName())]);
-        },
+        // --- COMBAT category ---
+        onEntityAttack:     function(cb) { this._setCallback('entityAttack', cb); },
+        onPlayerDamageMob:  function(cb) { this._setCallback('playerDamageMob', cb); },
 
-        sendMove: function(x, y) {
-            this.sendMessage([Types.Messages.MOVE,
-                              x,
-                              y]);
-        },
-    
-        sendLootMove: function(item, x, y) {
-            this.sendMessage([Types.Messages.LOOTMOVE,
-                              x,
-                              y,
-                              item.id]);
-        },
-    
-        sendAggro: function(mob) {
-            this.sendMessage([Types.Messages.AGGRO,
-                              mob.id]);
-        },
-    
-        sendAttack: function(mob) {
-            this.sendMessage([Types.Messages.ATTACK,
-                              mob.id]);
-        },
-    
-        sendHit: function(mob) {
-            this.sendMessage([Types.Messages.HIT,
-                              mob.id]);
-        },
-    
-        sendHurt: function(mob) {
-            this.sendMessage([Types.Messages.HURT,
-                              mob.id]);
-        },
-    
-        sendChat: function(text) {
-            this.sendMessage([Types.Messages.CHAT,
-                              text]);
-        },
-    
-        sendLoot: function(item) {
-            this.sendMessage([Types.Messages.LOOT,
-                              item.id]);
-        },
-    
-        sendTeleport: function(x, y) {
-            this.sendMessage([Types.Messages.TELEPORT,
-                              x,
-                              y]);
-        },
-    
-        sendWho: function(ids) {
-            ids.unshift(Types.Messages.WHO);
-            this.sendMessage(ids);
-        },
-    
-        sendZone: function() {
-            this.sendMessage([Types.Messages.ZONE]);
-        },
-    
-        sendOpen: function(chest) {
-            this.sendMessage([Types.Messages.OPEN,
-                              chest.id]);
-        },
-    
-        sendCheck: function(id) {
-            this.sendMessage([Types.Messages.CHECK,
-                              id]);
-        }
+        // --- PLAYER category ---
+        onPlayerChangeHealth:      function(cb) { this._setCallback('playerChangeHealth', cb); },
+        onPlayerChangeMaxHitPoints:function(cb) { this._setCallback('playerChangeMaxHitPoints', cb); },
+        onPlayerKillMob:           function(cb) { this._setCallback('playerKillMob', cb); },
+
+        // --- UI category ---
+        onChatMessage:      function(cb) { this._setCallback('chatMessage', cb); },
+        onPopulationChange: function(cb) { this._setCallback('populationChange', cb); }
     });
-    
+
     return GameClient;
 });
